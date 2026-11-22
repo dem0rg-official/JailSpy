@@ -827,7 +827,7 @@ def render_ui(screen: Any, colors: dict[str, int], t: Translator, rows: list[Rob
     _safe_add(screen, panel_y + 5, 1, telemetry_text, on if client_running else off, width - 2)
     pity_text = f"{t('pity_status')}: {t('pity_on') if auto.pity_enabled else t('pity_off')} ({int(auto.pity_delay)} {t('seconds')})"
     _safe_add(screen, panel_y + 5, 1 + len(telemetry_text), pity_text, on if auto.pity_enabled else off, max(1, width - len(telemetry_text) - 2))
-    _safe_add(screen, height - 3, 1, "[↑↓] " + t("select") + "   [Enter] " + t("join") + "   [A] " + t("auto") + "   [P] " + t("pity") + "   [D] " + t("delay") + "   [R] " + t("reload") + "   [L] " + t("language") + "   [S] " + t("settings") + "   [Q] " + t("quit"), colors["cyan"], width - 2)
+    _safe_add(screen, height - 3, 1, "[↑↓] " + t("select") + "   [Enter] " + t("join") + "   [A] " + t("auto") + "   [P] " + t("pity") + "   [R] " + t("reload") + "   [S] " + t("settings") + "   [Q] " + t("quit"), colors["cyan"], width - 2)
     screen.refresh()
 
 
@@ -1513,11 +1513,6 @@ async def run(args: argparse.Namespace) -> int:
                         auto.filters.player_count = False
                     else:
                         prompt_mode, prompt_buffer = "max_players", str(auto.filters.max_players)
-                elif action == "l":
-                    language = "en" if language == "ru" else "ru"
-                    t = Translator(language)
-                    config["language"] = language
-                    save_config(config, config_path)
                 elif action == "s":
                     screen.nodelay(False)
                     t, restart = await asyncio.to_thread(settings_menu, screen, colors, t, config, config_path, state_path, auto)
@@ -1526,8 +1521,6 @@ async def run(args: argparse.Namespace) -> int:
                     dirty = True
                     if restart:
                         break
-                elif action == "d":
-                    prompt_mode, prompt_buffer = "delay", str(int(auto.pity_delay))
                 elif action == "p":
                     auto.pity_enabled = not auto.pity_enabled
                     config["pity_cooldown_enabled"] = auto.pity_enabled

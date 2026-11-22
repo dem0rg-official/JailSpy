@@ -89,8 +89,6 @@ Hotkeys are shown in `[ ]` in the UI and also work on the Russian keyboard layou
 | `O` | Auto-join: only open robberies |
 | `N` | Auto-join: max player count (asks for the limit; press again to turn off) |
 | `P` | Toggle Pity cooldown |
-| `D` | Set Pity cooldown delay in seconds |
-| `L` | Switch language EN / RU (saved) |
 | `S` | Open the settings menu: language, data source, pity delay, change token |
 | `R` | Reconnect the data source |
 | `Q` / `Esc` | Quit |
