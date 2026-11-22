@@ -15,7 +15,7 @@ Interface languages: English and Russian (switch with `L`).
 ## Quick start
 
 ```bash
-git clone <this repository>
+git clone https://github.com/dem0rg-official/JailSpy.git
 cd JailSpy
 chmod +x run.sh
 ./run.sh
