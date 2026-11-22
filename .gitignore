@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+storage-state.json
+.pytest_cache/
+.config/
+*.tmp
+jailspy-config.json
+config.json
+.env
+*.env
+*.key
+*.pem
+.vscode/
+.idea/
