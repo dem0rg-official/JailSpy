@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import curses
 import json
 import locale
@@ -15,12 +16,15 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
+import urllib.error
+import urllib.request
+from urllib.parse import quote, urlencode
 
 LOG_PATH = Path.home() / ".local" / "share" / "jailspy" / "jailspy.log"
 log = logging.getLogger("jailspy")
@@ -35,8 +39,16 @@ def setup_logging() -> None:
 
 
 SITE_URL = "https://jailbreakchangelogs.com/robberies"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 ROBLOX_PLACE_ID = "606849621"
+MUFFIN_API = "https://api.muffinhook.site"
+MUFFIN_TOKEN_PATH = Path.home() / ".local" / "share" / "jailspy" / "muffinhook-token"
+MUFFIN_POLL_SECONDS = 5.0
+MUFFIN_ROBBERIES = {
+    "1": "Rising Bank", "2": "Jewelry Store", "3": "Museum", "4": "Power Plant",
+    "5": "Passenger Train", "6": "Cargo Train", "7": "Cargo Ship", "8": "Cargo Plane",
+    "12": "Bank Truck", "14": "Tomb", "15": "Casino", "16": "Mansion", "17": "Oil Rig",
+}
 CONFIG_PATH = Path.home() / ".config" / "jailspy" / "config.json"
 DEFAULT_STATE = Path.home() / ".local" / "share" / "jailspy" / "storage-state.json"
 REFRESH_SECONDS = 1.0
@@ -48,6 +60,9 @@ AUTO_RETRY_SECONDS = 5.0
 EARLY_EXIT_SECONDS = 60.0
 DEFAULT_PITY_DELAY = 210.0
 DEFAULT_MAX_PLAYERS = 25
+SERVER_ID_WIDTH = 36
+RESTART_EXIT_CODE = 75
+PROVIDERS = ("jailbreakchangelogs", "muffinhook")
 
 # Physical-key mapping so hotkeys work on the Russian (ЙЦУКЕН) layout.
 RU_TO_EN = dict(zip("йцукенгшщзхъфывапролджэячсмитьбю.", "qwertyuiop[]asdfghjkl;'zxcvbnm,./"))
@@ -110,7 +125,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "filter_key": "фильтр",
         "reload": "обновить",
         "quit": "выход",
-        "cycle": "Автоцикл: выбрать ограбление → свежий список → последний сервер → запуск Sober → ожидание завершения → повтор",
         "no_rows": "Нет активных ограблений",
         "no_candidate": "жду подходящий активный сервер",
         "refreshing": "обновляю список серверов перед подключением",
@@ -145,6 +159,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "english": "English",
         "choose_provider": "Выберите источник данных",
         "provider_only": "Jailbreak Changelogs (WebSocket)",
+        "provider_muffin": "MuffinHook (muffinhook.site)",
+        "settings": "настройки",
+        "source": "Источник",
+        "token": "Токен",
+        "change_token": "Сменить токен",
+        "token_keep": "Пустой ввод + Enter оставит текущий токен.",
+        "ok": "ОК",
+        "back": "назад",
+        "edit_value": "изменить",
+        "ws_data_error": "ошибка данных WebSocket",
+        "restart_note": "Источник или токен изменён, перезапускаю…",
+        "muffin_howto": "1. Войдите через Discord на https://www.muffinhook.site в своём браузере.\n2. Откройте DevTools (F12) → Application/Storage → Local Storage → https://www.muffinhook.site.\n3. Скопируйте значение ключа muffin_auth_token.",
+        "muffin_unauthorized": "MuffinHook отклонил токен (401). Запустите ./run.sh --setup и вставьте новый.",
         "auth_title": "Авторизация",
         "auth_success": "Сессия сохранена.",
         "auth_howto": "1. Войдите на {url} в своём браузере.\n2. Откройте DevTools (F12) → Application/Storage → Cookies → jailbreakchangelogs.com.\n3. Скопируйте значение cookie jbcl_token.",
@@ -207,7 +234,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "filter_key": "filter",
         "reload": "reload",
         "quit": "quit",
-        "cycle": "Auto cycle: choose robbery → fresh list → latest server → launch Sober → wait for exit → repeat",
         "no_rows": "No active robberies",
         "no_candidate": "waiting for a matching active server",
         "refreshing": "refreshing server list before joining",
@@ -242,6 +268,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "english": "English",
         "choose_provider": "Choose data source",
         "provider_only": "Jailbreak Changelogs (WebSocket)",
+        "provider_muffin": "MuffinHook (muffinhook.site)",
+        "settings": "settings",
+        "source": "Source",
+        "token": "Token",
+        "change_token": "Change token",
+        "token_keep": "Empty input + Enter keeps the current token.",
+        "ok": "OK",
+        "back": "back",
+        "edit_value": "edit",
+        "ws_data_error": "WebSocket data error",
+        "restart_note": "Source or token changed, restarting…",
+        "muffin_howto": "1. Sign in with Discord at https://www.muffinhook.site in your own browser.\n2. Open DevTools (F12) → Application/Storage → Local Storage → https://www.muffinhook.site.\n3. Copy the value of the muffin_auth_token key.",
+        "muffin_unauthorized": "MuffinHook rejected the token (401). Run ./run.sh --setup and paste a new one.",
         "auth_title": "Authentication",
         "auth_success": "Session saved.",
         "auth_howto": "1. Sign in at {url} in your own browser.\n2. Open DevTools (F12) → Application/Storage → Cookies → jailbreakchangelogs.com.\n3. Copy the value of the jbcl_token cookie.",
@@ -284,6 +323,11 @@ class Robbery:
     server_full: bool
     timestamp: str
     raw: dict[str, Any]
+    source_id: str = ""
+
+    @property
+    def joinable(self) -> bool:
+        return bool(self.job_id)
 
     @property
     def timer(self) -> str:
@@ -322,7 +366,7 @@ class AutoJoin:
     process: subprocess.Popen[Any] | None = None
     current_job: str = ""
     last_job: str = ""
-    phase: str = "Off"
+    phase: str = "off"
     last_error: str = ""
     retry_at: float = 0.0
     launches: int = 0
@@ -331,7 +375,7 @@ class AutoJoin:
     pity_delay: float = DEFAULT_PITY_DELAY
     filters: JoinFilters = field(default_factory=JoinFilters)
 
-    def stop(self, phase: str = "Off") -> None:
+    def stop(self, phase: str = "off") -> None:
         if self.process is not None and self.process.poll() is None:
             try:
                 self.process.terminate()
@@ -385,8 +429,8 @@ def _status(value: Any) -> tuple[str, int]:
             elif lowered in {"closed", "complete", "completed", "finished"}:
                 value = 3
     code = int(value) if isinstance(value, (int, float)) else 0
-    labels = {1: "Открыто", 2: "Активно", 3: "Завершено"}
-    return labels.get(code, "Неизвестно"), code
+    labels = {1: "Open", 2: "Active", 3: "Completed"}
+    return labels.get(code, "Unknown"), code
 
 
 def _localized_status(status_code: int, t: Translator) -> str:
@@ -512,7 +556,7 @@ def normalize_feed(items: Any) -> list[Robbery]:
         players = str(total_players) if total_players is not None else "—"
 
         job_id = str(_first(item, "job_id", "jobId", default=_first(server, "job_id", "jobId")))
-        name = str(_first(item, "name", "display_name", "marker_name", default="Без названия"))
+        name = str(_first(item, "name", "display_name", "marker_name", default="—"))
         marker = str(_first(item, "marker_name", default=name))
         timestamp = str(_first(item, "timestamp", "opened_at", "open_time", "created_at", default=""))
         opening_value = _first(item, "opening_time", "opened_at", "open_time", "timestamp", default="")
@@ -536,8 +580,92 @@ def normalize_feed(items: Any) -> list[Robbery]:
     return result
 
 
+def _muffin_status(value: Any) -> tuple[str, int]:
+    text = str(value or "").strip().casefold()
+    if text.startswith("open"):
+        return "Open", 1
+    if text in ("in robbery", "robbery in progress"):
+        return "Active", 2
+    return "Unknown", 0
+
+
+def normalize_muffin_feed(data: Any) -> list[Robbery]:
+    """Turn the /export/servers payload into one row per open or active robbery."""
+    top: dict[str, Any] = {}
+    if isinstance(data, dict):
+        top = data
+        data = data.get("servers")
+    if not isinstance(data, list):
+        return []
+    rows: list[Robbery] = []
+    for server in data:
+        if not isinstance(server, dict):
+            continue
+        info = server.get("ServerInfo") if isinstance(server.get("ServerInfo"), dict) else {}
+        job_id = str(info.get("JobID") or "")
+        robberies = server.get("RobberyData")
+        if not job_id or not isinstance(robberies, dict):
+            continue
+        criminals = _number(info.get("CrimCount"))
+        cops = _number(info.get("PoliceCount"))
+        total = criminals + cops if criminals is not None and cops is not None else None
+        updated = server.get("lastUpdated")
+        if isinstance(updated, dict):
+            updated = updated.get("$date")
+        timestamp = str(updated or "")
+        geo = server.get("RegionData")
+        geo = geo.get("geolocation") if isinstance(geo, dict) else None
+        region = ", ".join(str(geo[k]) for k in ("city", "regionName", "country") if isinstance(geo, dict) and geo.get(k)) or "—"
+        source_id = str(server.get("_id") or "")
+        for robbery_id, entry in robberies.items():
+            entry = entry if isinstance(entry, dict) else {}
+            descs = entry.get("Descs") if isinstance(entry.get("Descs"), dict) else {}
+            status, code = _muffin_status(descs.get("Status"))
+            if code not in (1, 2):
+                continue
+            name = str(entry.get("name") or MUFFIN_ROBBERIES.get(str(robbery_id), f"Robbery {robbery_id}"))
+            rows.append(Robbery(
+                name=name, marker=name, status=status, status_code=code,
+                opening_time=_format_opening_time(timestamp), job_id=job_id, server_time="—",
+                players=str(total) if total is not None else "—", total_players=total,
+                criminals=criminals, cops=cops, region=region,
+                server_full=_is_server_full(criminals, cops), timestamp=timestamp,
+                raw=server, source_id=source_id,
+            ))
+    return rows
+
+
+def muffin_request(token: str, server_id: str | None = None) -> Any:
+    url = MUFFIN_API + "/export/servers" + (f"?{urlencode({'id': server_id})}" if server_id else "")
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": "JailSpy"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError("muffin_unauthorized" if exc.code in (401, 403) else f"MuffinHook HTTP {exc.code}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"MuffinHook: bad JSON ({exc})") from exc
+
+
+def resolve_join_uri(row: Robbery, token: str = "") -> str | None:
+    """Return the Roblox URI for a row. MuffinHook rows need a second request for the real job ID."""
+    if not row.source_id:
+        return row.join_uri
+    info = muffin_request(token, row.source_id)
+    if not isinstance(info, dict):
+        return None
+    place = quote(str(info.get("placeId") or ROBLOX_PLACE_ID), safe="")
+    if info.get("launchData"):
+        return f"roblox://experiences/start?placeId={place}&launchData={quote(str(info['launchData']), safe='')}"
+    if info.get("private") and info.get("accessCode"):
+        return f"roblox://navigation/share_links?code={quote(str(info['accessCode']), safe='')}&type=Server"
+    if info.get("jobId"):
+        return f"roblox://experiences/start?placeId={place}&gameInstanceId={quote(str(info['jobId']), safe='')}"
+    return None
+
+
 def latest_for_marker(rows: list[Robbery], marker: str, filters: JoinFilters | None = None, exclude_job: str = "") -> Robbery | None:
-    candidates = [row for row in rows if row.marker == marker and row.join_uri and not (exclude_job and row.job_id == exclude_job)]
+    candidates = [row for row in rows if row.marker == marker and row.joinable and not (exclude_job and row.job_id == exclude_job)]
     if filters is not None:
         candidates = [
             row for row in candidates
@@ -593,18 +721,19 @@ def _init_colors() -> dict[str, int]:
 def _table_columns(t: Translator, width: int) -> list[tuple[str, int]]:
     columns = [
         ("№", 3), (t("robbery"), 20), (t("status"), 10), (t("time"), 8),
-        (t("server"), 17), (t("total"), 5), (t("criminals"), 5),
-        (t("cops"), 5), (t("region"), 8), (t("full"), 5),
+        (t("server"), SERVER_ID_WIDTH), (t("total"), 5), (t("criminals"), 5),
+        (t("cops"), 5), (t("full"), 5),
     ]
     gap = 2 * (len(columns) - 1)
-    minimums = [2, 10, 6, 8, 8, 3, 3, 3, 4, 3]
-    while sum(size for _, size in columns) + gap > max(1, width):
-        candidates = [i for i, (_, size) in enumerate(columns) if size > minimums[i]]
-        if not candidates:
-            break
-        index = max(candidates, key=lambda i: columns[i][1])
-        title, size = columns[index]
-        columns[index] = (title, size - 1)
+    # First squeeze everything except the full server ID, then let the ID shrink too.
+    for minimums in ([2, 12, 6, 8, SERVER_ID_WIDTH, 3, 3, 3, 3], [2, 8, 6, 8, 8, 3, 3, 3, 3]):
+        while sum(size for _, size in columns) + gap > max(1, width):
+            candidates = [i for i, (_, size) in enumerate(columns) if size > minimums[i]]
+            if not candidates:
+                break
+            index = max(candidates, key=lambda i: columns[i][1])
+            title, size = columns[index]
+            columns[index] = (title, size - 1)
     return columns
 
 
@@ -615,7 +744,7 @@ def _row_cells(t: Translator, row: Robbery) -> list[str]:
         str(row.total_players if row.total_players is not None else "—"),
         str(row.criminals if row.criminals is not None else "—"),
         str(row.cops if row.cops is not None else "—"),
-        row.region, t("yes") if row.server_full else t("no"),
+        t("yes") if row.server_full else t("no"),
     ]
 
 
@@ -658,7 +787,7 @@ def render_ui(screen: Any, colors: dict[str, int], t: Translator, rows: list[Rob
             cell_attr = attr
             if line != selected and index == 2:
                 cell_attr = colors["green"] if row.status_code == 1 else colors["yellow"]
-            if line != selected and index == 9 and row.server_full:
+            if line != selected and index == 8 and row.server_full:
                 cell_attr = colors["red"]
             _safe_add(screen, y, x, _clip(cell, column_width), cell_attr, column_width)
             x += column_width + 2
@@ -670,7 +799,7 @@ def render_ui(screen: Any, colors: dict[str, int], t: Translator, rows: list[Rob
             elapsed = int(time.monotonic() - auto.started_at)
             auto_text = t("auto_running", marker=auto.marker, launches=auto.launches, elapsed=elapsed, job=auto.current_job)
         else:
-            auto_text = t("auto_state", marker=auto.marker, phase=auto.phase)
+            auto_text = t("auto_state", marker=auto.marker, phase=t(auto.phase))
             remaining = auto.retry_at - time.monotonic()
             if auto.retry_at and remaining > 0:
                 auto_text += f" · {t('next_launch')}: {int(remaining) + 1} {t('seconds')}"
@@ -689,7 +818,7 @@ def render_ui(screen: Any, colors: dict[str, int], t: Translator, rows: list[Rob
         _safe_add(screen, panel_y + 2, x, text, on if active else off, max(1, width - x - 1))
         x += len(text) + 3
     if auto.last_error:
-        _safe_add(screen, panel_y + 3, 1, f"{t('auto_error')}: {auto.last_error}", colors["red"], width - 2)
+        _safe_add(screen, panel_y + 3, 1, f"{t('auto_error')}: {err_text(t, auto.last_error)}", colors["red"], width - 2)
     elif message:
         _safe_add(screen, panel_y + 3, 1, message, colors["cyan"], width - 2)
     client_state = t("roblox_running") if client_running else t("roblox_closed")
@@ -698,8 +827,7 @@ def render_ui(screen: Any, colors: dict[str, int], t: Translator, rows: list[Rob
     _safe_add(screen, panel_y + 5, 1, telemetry_text, on if client_running else off, width - 2)
     pity_text = f"{t('pity_status')}: {t('pity_on') if auto.pity_enabled else t('pity_off')} ({int(auto.pity_delay)} {t('seconds')})"
     _safe_add(screen, panel_y + 5, 1 + len(telemetry_text), pity_text, on if auto.pity_enabled else off, max(1, width - len(telemetry_text) - 2))
-    _safe_add(screen, height - 3, 1, "[↑↓] " + t("select") + "   [Enter] " + t("join") + "   [A] " + t("auto") + "   [P] " + t("pity") + "   [D] " + t("delay") + "   [R] " + t("reload") + "   [L] " + t("language") + "   [Q] " + t("quit"), colors["cyan"], width - 2)
-    _safe_add(screen, height - 2, 1, t("cycle"), colors["dim"], width - 2)
+    _safe_add(screen, height - 3, 1, "[↑↓] " + t("select") + "   [Enter] " + t("join") + "   [A] " + t("auto") + "   [P] " + t("pity") + "   [D] " + t("delay") + "   [R] " + t("reload") + "   [L] " + t("language") + "   [S] " + t("settings") + "   [Q] " + t("quit"), colors["cyan"], width - 2)
     screen.refresh()
 
 
@@ -711,19 +839,26 @@ def read_command(timeout: float) -> str | None:
 LEGACY_STATE = Path.home() / ".local" / "share" / "hyperchrome-tracker" / "storage-state.json"
 
 
-def manual_token_session(state_path: Path, t: Translator) -> bool:
-    """Ask for the jbcl_token value and store it, keeping any other cookies already saved."""
-    import getpass
-
-    print(f"\n{t('auth_title')}\n{t('auth_howto', url=SITE_URL)}")
+def read_muffin_token(path: Path = MUFFIN_TOKEN_PATH) -> str:
     try:
-        token = getpass.getpass(t("auth_paste")).strip().strip('"\'')
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    if not token or any(ch.isspace() for ch in token):
-        print(t("auth_invalid"))
-        return False
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_private(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def save_token(provider: str, token: str, state_path: Path) -> None:
+    """Store the pasted token: a cookie in the Playwright state, or a plain private file for MuffinHook."""
+    if provider == "muffinhook":
+        _write_private(MUFFIN_TOKEN_PATH, token)
+        return
     cookies: list[dict[str, Any]] = []
     if state_path.exists():
         try:
@@ -735,28 +870,20 @@ def manual_token_session(state_path: Path, t: Translator) -> bool:
         "name": "jbcl_token", "value": token, "domain": ".jailbreakchangelogs.com",
         "path": "/", "expires": -1, "httpOnly": False, "secure": True, "sameSite": "Lax",
     })
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = state_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"cookies": cookies, "origins": []}), encoding="utf-8")
-    temporary.chmod(0o600)
-    temporary.replace(state_path)
-    print(t("auth_success"))
-    return True
+    _write_private(state_path, json.dumps({"cookies": cookies, "origins": []}))
 
 
-def ensure_session(state_path: Path, t: Translator, force: bool = False) -> bool:
-    """Make sure a session file exists; with force, always ask for a new token."""
-    if force:
-        return manual_token_session(state_path, t) or state_path.exists()
+def has_session(provider: str, state_path: Path) -> bool:
+    if provider == "muffinhook":
+        return bool(read_muffin_token())
     if state_path.exists():
         return True
     if LEGACY_STATE.exists():
         state_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(LEGACY_STATE, state_path)
         state_path.chmod(0o600)
-        print(t("auth_migrated"))
         return True
-    return manual_token_session(state_path, t)
+    return False
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any] | None:
@@ -774,33 +901,253 @@ def save_config(config: dict[str, Any], path: Path = CONFIG_PATH) -> None:
     temporary.replace(path)
 
 
-def choose_language() -> str:
-    print("\nJailSpy — first-run setup / первоначальная настройка")
-    print("[1] Русский\n[2] English")
-    answer = input("> ").strip().casefold()
-    return "en" if answer in {"2", "en", "english"} else "ru"
+# ---------------------------------------------------------------- TUI screens
+
+@contextlib.contextmanager
+def tui_screen() -> Any:
+    """Own the terminal for the setup wizard and for token prompts outside the dashboard."""
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    screen = curses.initscr()
+    try:
+        curses.noecho()
+        curses.cbreak()
+        screen.keypad(True)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        yield screen, _init_colors()
+    finally:
+        try:
+            curses.nocbreak()
+            screen.keypad(False)
+            curses.echo()
+            curses.endwin()
+        except curses.error:
+            pass
+
+
+def _wrap_lines(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        lines.extend(textwrap.wrap(paragraph, max(10, width)) or [""])
+    return lines
+
+
+def _draw_screen(screen: Any, colors: dict[str, int], t: Translator, title: str, body: str) -> tuple[int, int]:
+    """Draw the common header, title and wrapped body. Returns the next free row and the screen width."""
+    height, width = screen.getmaxyx()
+    screen.erase()
+    _safe_add(screen, 0, 0, f" {t('app_title')} — {t('tagline')} ", colors["title"], width)
+    _safe_add(screen, 2, 2, title, colors["cyan"], width - 4)
+    _safe_add(screen, 3, 2, "─" * max(1, width - 4), colors["dim"])
+    y = 5
+    for line in _wrap_lines(body, width - 4) if body else []:
+        if y >= height - 2:
+            break
+        _safe_add(screen, y, 2, line, colors["normal"], width - 4)
+        y += 1
+    return y + (1 if body else 0), width
+
+
+def tui_choice(screen: Any, colors: dict[str, int], t: Translator, title: str, options: list[str], body: str = "", index: int = 0) -> int | None:
+    """Pick one option with arrows or digits. Enter confirms, Esc returns None."""
+    index = max(0, min(index, len(options) - 1))
+    screen.nodelay(False)
+    while True:
+        y, width = _draw_screen(screen, colors, t, title, body)
+        height = screen.getmaxyx()[0]
+        for number, option in enumerate(options):
+            if y + number >= height - 2:
+                break
+            attr = colors["selected"] if number == index else colors["normal"]
+            _safe_add(screen, y + number, 2, f" [{number + 1}] {option} ".ljust(max(1, width - 4)), attr, width - 4)
+        _safe_add(screen, height - 1, 2, f"[↑↓] {t('select')}   [Enter] {t('ok')}   [Esc] {t('back')}", colors["dim"], width - 4)
+        screen.refresh()
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
+        if key == curses.KEY_UP or (isinstance(key, str) and normalize_key(key) == "k"):
+            index = (index - 1) % len(options)
+        elif key == curses.KEY_DOWN or (isinstance(key, str) and normalize_key(key) == "j"):
+            index = (index + 1) % len(options)
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            return index
+        elif key == "\x1b":
+            return None
+        elif isinstance(key, str) and key.isdigit() and 1 <= int(key) <= len(options):
+            index = int(key) - 1
+
+
+def tui_input(screen: Any, colors: dict[str, int], t: Translator, title: str, label: str, body: str = "", hidden: bool = False, initial: str = "", error: str = "") -> str | None:
+    """Single-line input. Hidden mode shows dots. Enter confirms, Esc returns None."""
+    buffer = initial
+    screen.nodelay(False)
+    while True:
+        y, width = _draw_screen(screen, colors, t, title, body)
+        height = screen.getmaxyx()[0]
+        shown = ("•" * len(buffer)) if hidden else buffer
+        room = max(1, width - 8 - len(label))
+        _safe_add(screen, y, 2, f"{label}: ", colors["yellow"], width - 4)
+        _safe_add(screen, y, 4 + len(label), shown[-room:] + "█", colors["normal"], room + 1)
+        if hidden and buffer:
+            _safe_add(screen, y + 1, 2, f"({len(buffer)})", colors["dim"], width - 4)
+        if error:
+            _safe_add(screen, y + 3, 2, error, colors["red"], width - 4)
+        _safe_add(screen, height - 1, 2, f"[Enter] {t('ok')}   [Esc] {t('back')}", colors["dim"], width - 4)
+        screen.refresh()
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            return buffer.strip().strip('"\'')
+        if key == "\x1b":
+            return None
+        if key in ("\x7f", "\b", curses.KEY_BACKSPACE):
+            buffer = buffer[:-1]
+        elif isinstance(key, str) and key.isprintable() and len(buffer) < 4096:
+            buffer += key
+        error = ""
+
+
+def tui_token_step(screen: Any, colors: dict[str, int], t: Translator, provider: str, state_path: Path, can_keep: bool) -> str:
+    """Ask for the token. Returns 'saved', 'kept' (empty input, existing token) or 'back' (Esc)."""
+    if provider == "muffinhook":
+        body = t("muffin_howto")
+    else:
+        body = t("auth_howto", url=SITE_URL)
+    if can_keep:
+        body += "\n\n" + t("token_keep")
+    error = ""
+    while True:
+        value = tui_input(screen, colors, t, t("auth_title"), t("token"), body, hidden=True, error=error)
+        if value is None:
+            return "back"
+        if not value:
+            if can_keep:
+                return "kept"
+            error = t("auth_invalid")
+            continue
+        if any(ch.isspace() for ch in value):
+            error = t("auth_invalid")
+            continue
+        save_token(provider, value, state_path)
+        return "saved"
+
+
+def provider_title(t: Translator, provider: str) -> str:
+    return t("provider_muffin") if provider == "muffinhook" else t("provider_only")
+
+
+def setup_wizard(screen: Any, colors: dict[str, int], existing: dict[str, Any], config_path: Path, state_path: Path) -> dict[str, Any] | None:
+    """Language -> source -> token. Esc steps back; Esc on the first step cancels."""
+    language = str(existing.get("language", "ru"))
+    provider = str(existing.get("provider", PROVIDERS[0]))
+    step = 0
+    while True:
+        t = Translator(language)
+        if step == 0:
+            picked = tui_choice(screen, colors, Translator("en"), f"{t('wizard_title')} · {t('choose_language')}", ["Русский", "English"], index=0 if language == "ru" else 1)
+            if picked is None:
+                return None
+            language = ("ru", "en")[picked]
+            step = 1
+        elif step == 1:
+            picked = tui_choice(screen, colors, t, f"{t('wizard_title')} · {t('choose_provider')}", [provider_title(t, p) for p in PROVIDERS], index=PROVIDERS.index(provider) if provider in PROVIDERS else 0)
+            if picked is None:
+                step = 0
+                continue
+            provider = PROVIDERS[picked]
+            step = 2
+        else:
+            result = tui_token_step(screen, colors, t, provider, state_path, has_session(provider, state_path) and provider == existing.get("provider", provider))
+            if result == "back":
+                step = 1
+                continue
+            config = {
+                "setup_complete": True,
+                "language": language,
+                "provider": provider,
+                "state_path": str(state_path),
+                "pity_cooldown_enabled": bool(existing.get("pity_cooldown_enabled", False)),
+                "pity_delay": float(existing.get("pity_delay", DEFAULT_PITY_DELAY)),
+            }
+            save_config(config, config_path)
+            return config
 
 
 def run_setup(force: bool = False, config_path: Path = CONFIG_PATH, state_path: Path = DEFAULT_STATE) -> dict[str, Any]:
     existing = load_config(config_path)
     if existing and not force:
         return existing
-    language = choose_language()
-    t = Translator(language)
-    print(f"\n{t('choose_provider')}\n[1] {t('provider_only')}")
-    input("> ")
-    ensure_session(state_path, t, force=True)
-    config = {
-        "setup_complete": True,
-        "language": language,
-        "provider": "jailbreakchangelogs",
-        "state_path": str(state_path),
-        "pity_cooldown_enabled": False,
-        "pity_delay": DEFAULT_PITY_DELAY,
-    }
-    save_config(config, config_path)
-    print(t("setup_done"))
+    with tui_screen() as (screen, colors):
+        config = setup_wizard(screen, colors, existing or {}, config_path, state_path)
+    if config is None:
+        if existing:
+            return existing
+        raise SystemExit(1)
     return config
+
+
+def settings_menu(screen: Any, colors: dict[str, int], t: Translator, config: dict[str, Any], config_path: Path, state_path: Path, auto: AutoJoin) -> tuple[Translator, bool]:
+    """Modal settings screen. Returns the (possibly new) translator and whether the data source must restart."""
+    restart = False
+    index = 0
+    while True:
+        language = str(config.get("language", "ru"))
+        provider = str(config.get("provider", PROVIDERS[0]))
+        items = [
+            f"{t('language').capitalize()}: {'Русский' if language == 'ru' else 'English'}",
+            f"{t('source')}: {provider_title(t, provider)}",
+            f"{t('delay').capitalize()} ({t('seconds')}): {int(auto.pity_delay)}",
+            t("change_token"),
+            t("back").capitalize(),
+        ]
+        picked = tui_choice(screen, colors, t, t("settings").capitalize(), items, index=index)
+        if picked is None or picked == 4:
+            break
+        index = picked
+        if picked == 0:
+            choice = tui_choice(screen, colors, t, t("language").capitalize(), ["Русский", "English"], index=0 if language == "ru" else 1)
+            if choice is not None:
+                config["language"] = ("ru", "en")[choice]
+                save_config(config, config_path)
+                t = Translator(config["language"])
+        elif picked == 1:
+            choice = tui_choice(screen, colors, t, t("source"), [provider_title(t, p) for p in PROVIDERS], index=PROVIDERS.index(provider) if provider in PROVIDERS else 0)
+            if choice is None or PROVIDERS[choice] == provider:
+                continue
+            new_provider = PROVIDERS[choice]
+            if not has_session(new_provider, state_path):
+                if tui_token_step(screen, colors, t, new_provider, state_path, False) != "saved":
+                    continue
+            config["provider"] = new_provider
+            save_config(config, config_path)
+            restart = True
+            break
+        elif picked == 2:
+            error = ""
+            while True:
+                value = tui_input(screen, colors, t, t("settings").capitalize(), f"{t('delay').capitalize()} ({t('seconds')})", initial=str(int(auto.pity_delay)), error=error)
+                if value is None:
+                    break
+                if value.isdigit():
+                    auto.pity_delay = float(int(value))
+                    config["pity_delay"] = auto.pity_delay
+                    save_config(config, config_path)
+                    break
+                error = t("invalid_number")
+        elif picked == 3:
+            if tui_token_step(screen, colors, t, provider, state_path, True) == "saved":
+                restart = True
+                break
+    return t, restart
 
 
 def _process_rows() -> list[tuple[int, str]]:
@@ -844,6 +1191,12 @@ def close_roblox_clients() -> int:
     return len(processes)
 
 
+def err_text(t: Translator, error: Any) -> str:
+    """Translate an error that carries a translation key; pass other text through."""
+    text = str(error)
+    return t(text) if text in TRANSLATIONS["en"] else text
+
+
 def sober_available() -> bool:
     if not shutil.which("flatpak"):
         return False
@@ -854,11 +1207,11 @@ def launch_sober(uri: str, require_sober: bool = False) -> subprocess.Popen[Any]
     if sober_available():
         command = ["flatpak", "run", "org.vinegarhq.Sober", uri]
     elif require_sober:
-        raise RuntimeError("Sober не найден: установите org.vinegarhq.Sober для автоподключения")
+        raise RuntimeError("sober_missing")
     else:
         opener = shutil.which("xdg-open")
         if not opener:
-            raise RuntimeError("Не найден flatpak или xdg-open")
+            raise RuntimeError("no_opener")
         command = [opener, uri]
     close_roblox_clients()
     return subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -872,17 +1225,25 @@ async def run(args: argparse.Namespace) -> int:
     t = Translator(language)
     state_path = state_path_arg or Path(str(config.get("state_path", DEFAULT_STATE))).expanduser()
     log.info("start: state=%s exists=%s", state_path, state_path.exists())
-    if not ensure_session(state_path, t):
-        log.error("exit: no session")
-        print(t("login_required"), f"(log: {LOG_PATH})")
-        return 2
+    provider = str(config.get("provider", PROVIDERS[0]))
+    muffin = provider == "muffinhook"
+    if not has_session(provider, state_path):
+        with tui_screen() as (setup_screen, setup_colors):
+            token_result = tui_token_step(setup_screen, setup_colors, t, provider, state_path, False)
+        if token_result != "saved":
+            log.error("exit: no session")
+            print(t("login_required"), f"(log: {LOG_PATH})")
+            return 2
+    muffin_token = read_muffin_token() if muffin else ""
 
     from playwright.async_api import BrowserContext, TimeoutError as PlaywrightTimeoutError, async_playwright
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context: BrowserContext = await browser.new_context(storage_state=str(state_path) if state_path.exists() else None)
-        page = await context.new_page()
+        browser = context = page = None
+        if not muffin:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(state_path) if state_path.exists() else None)
+            page = await context.new_page()
         feed: list[Robbery] = []
         last_frame_at = time.monotonic()
         frame_seq = 0
@@ -905,11 +1266,12 @@ async def run(args: argparse.Namespace) -> int:
                         frame_seq += 1
                         log.info("feed updated: %d active", len(feed))
                 except (ValueError, UnicodeDecodeError, AttributeError) as exc:
-                    last_error = f"ошибка данных WebSocket: {exc}"
+                    last_error = f"{t('ws_data_error')}: {exc}"
 
             ws.on("framereceived", on_frame)
 
-        page.on("websocket", lambda ws: asyncio.create_task(handle_ws(ws)))
+        if page is not None:
+            page.on("websocket", lambda ws: asyncio.create_task(handle_ws(ws)))
         os.environ.setdefault("ESCDELAY", "25")
         try:
             locale.setlocale(locale.LC_ALL, "")
@@ -930,6 +1292,30 @@ async def run(args: argparse.Namespace) -> int:
         reload_task: asyncio.Task[None] | None = None
         auto_refresh_task: asyncio.Task[None] | None = None
         auto_refresh_seq = 0
+        muffin_task: asyncio.Task[None] | None = None
+        restart = False
+
+        async def fetch_muffin() -> None:
+            nonlocal feed, connected, last_error, last_frame_at, frame_seq
+            try:
+                data = await asyncio.to_thread(muffin_request, muffin_token)
+                feed = normalize_muffin_feed(data)
+                connected = True
+                last_error = None
+                last_frame_at = time.monotonic()
+                frame_seq += 1
+                log.info("muffinhook feed updated: %d active", len(feed))
+            except (OSError, RuntimeError) as exc:
+                connected = False
+                text = str(exc)
+                last_error = err_text(t, text)
+                log.warning("muffinhook fetch failed: %s", exc)
+
+        async def muffin_poller() -> None:
+            while True:
+                await asyncio.sleep(MUFFIN_POLL_SECONDS)
+                await fetch_muffin()
+
         try:
             curses.noecho()
             curses.cbreak()
@@ -938,23 +1324,31 @@ async def run(args: argparse.Namespace) -> int:
             curses.curs_set(0)
             colors = _init_colors()
             render_ui(screen, colors, t, feed, 0, "", False, None, auto, telemetry, "", False)
-            await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
-            deadline = time.monotonic() + 8.0
-            while not feed and time.monotonic() < deadline:
-                await asyncio.sleep(0.1)
-            body = await page.locator("body").inner_text()
+            if muffin:
+                await fetch_muffin()
+                muffin_task = asyncio.create_task(muffin_poller())
+                body = ""
+            else:
+                await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
+                deadline = time.monotonic() + 8.0
+                while not feed and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                body = await page.locator("body").inner_text()
             last_frame_at = time.monotonic()
             dirty = True
             last_render = 0.0
             last_client_check = -CLIENT_CHECK_SECONDS
             client_running = False
-            log.info("page loaded: url=%s ws_connected=%s feed=%d body_head=%r", page.url, connected, len(feed), body[:120])
-            if not connected and not feed and any(token in body for token in ("Login", "Log in", "Войти")):
+            log.info("page loaded: url=%s ws_connected=%s feed=%d body_head=%r", page.url if page else "muffinhook", connected, len(feed), body[:120])
+            if not muffin and not connected and not feed and any(token in body for token in ("Login", "Log in", "Войти")):
                 last_error = f"{t('login_required')} (log: {LOG_PATH})"
                 log.warning("login wall: no websocket and login text on page")
 
             async def refresh_feed() -> None:
                 nonlocal connected, last_error
+                if muffin:
+                    await fetch_muffin()
+                    return
                 connected = False
                 seq_before = frame_seq
                 try:
@@ -996,39 +1390,42 @@ async def run(args: argparse.Namespace) -> int:
                             auto.process = None
                             if time.monotonic() - auto.started_at < EARLY_EXIT_SECONDS:
                                 delay = AUTO_RETRY_SECONDS
-                                auto.phase = t("early_exit")
+                                auto.phase = "early_exit"
                                 log.info("client closed after %.0fs (<%ds), relaunching without pity", time.monotonic() - auto.started_at, EARLY_EXIT_SECONDS)
                             else:
                                 delay = auto.pity_delay if auto.pity_enabled else AUTO_RETRY_SECONDS
-                                auto.phase = t("process_done")
+                                auto.phase = "process_done"
                             auto.retry_at = time.monotonic() + delay
                     elif auto_refresh_task is None and time.monotonic() >= auto.retry_at:
                         auto_refresh_seq = frame_seq
-                        auto.phase = t("refreshing")
+                        auto.phase = "refreshing"
                         auto_refresh_task = asyncio.create_task(refresh_feed())
                     elif auto_refresh_task is not None and auto_refresh_task.done():
                         auto_refresh_task = None
                         candidate = latest_for_marker(feed, auto.marker, auto.filters, auto.last_job) if frame_seq != auto_refresh_seq else None
                         if candidate is None:
-                            auto.phase = t("no_candidate")
+                            auto.phase = "no_candidate"
                             auto.retry_at = time.monotonic() + AUTO_RETRY_SECONDS
-                        elif not candidate.join_uri:
-                            auto.phase = t("no_server_id")
+                        elif not candidate.joinable:
+                            auto.phase = "no_server_id"
                             auto.retry_at = time.monotonic() + AUTO_RETRY_SECONDS
                         else:
                             try:
-                                auto.process = launch_sober(candidate.join_uri, require_sober=True)
+                                uri = await asyncio.to_thread(resolve_join_uri, candidate, muffin_token)
+                                if not uri:
+                                    raise RuntimeError("no_server_id")
+                                auto.process = launch_sober(uri, require_sober=True)
                                 auto.current_job = candidate.job_id
                                 auto.last_job = candidate.job_id
                                 auto.started_at = time.monotonic()
                                 auto.launches += 1
                                 telemetry.launches += 1
                                 telemetry.last_launch = time.time()
-                                auto.phase = t("waiting_process")
+                                auto.phase = "waiting_process"
                                 auto.last_error = ""
                             except (OSError, RuntimeError) as exc:
                                 auto.last_error = str(exc)
-                                auto.phase = t("error")
+                                auto.phase = "error"
                                 auto.retry_at = time.monotonic() + AUTO_RETRY_SECONDS
 
                 try:
@@ -1101,7 +1498,7 @@ async def run(args: argparse.Namespace) -> int:
                         auto.enabled = True
                         auto.marker = visible[selected].marker
                         auto.last_job = ""
-                        auto.phase = t("refreshing")
+                        auto.phase = "refreshing"
                         auto.last_error = ""
                         auto.retry_at = 0.0
                         message = t("auto_enabled", marker=auto.marker)
@@ -1121,6 +1518,14 @@ async def run(args: argparse.Namespace) -> int:
                     t = Translator(language)
                     config["language"] = language
                     save_config(config, config_path)
+                elif action == "s":
+                    screen.nodelay(False)
+                    t, restart = await asyncio.to_thread(settings_menu, screen, colors, t, config, config_path, state_path, auto)
+                    screen.nodelay(True)
+                    language = t.language
+                    dirty = True
+                    if restart:
+                        break
                 elif action == "d":
                     prompt_mode, prompt_buffer = "delay", str(int(auto.pity_delay))
                 elif action == "p":
@@ -1130,18 +1535,21 @@ async def run(args: argparse.Namespace) -> int:
                 elif action == "enter":
                     if visible:
                         row = visible[selected]
-                        if row.join_uri:
+                        if row.joinable:
                             try:
-                                await asyncio.to_thread(launch_sober, row.join_uri)
+                                uri = await asyncio.to_thread(resolve_join_uri, row, muffin_token)
+                                if not uri:
+                                    raise RuntimeError("no_server_id")
+                                await asyncio.to_thread(launch_sober, uri)
                                 telemetry.launches += 1
                                 telemetry.last_launch = time.time()
                                 message = t("launch_sent", name=row.name)
                             except (OSError, RuntimeError) as exc:
-                                message = str(exc)
+                                message = err_text(t, exc)
                         else:
                             message = t("no_server_id")
         finally:
-            for task in (reload_task, auto_refresh_task):
+            for task in (reload_task, auto_refresh_task, muffin_task):
                 if task is not None:
                     task.cancel()
             auto.stop()
@@ -1152,25 +1560,31 @@ async def run(args: argparse.Namespace) -> int:
                 curses.endwin()
             except curses.error:
                 pass
-            await context.close()
-            await browser.close()
-    return 0
+            if context is not None:
+                await context.close()
+            if browser is not None:
+                await browser.close()
+    return RESTART_EXIT_CODE if restart else 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="JailSpy server tracker TUI")
     parser.add_argument("--version", action="version", version=f"JailSpy {__version__}")
-    parser.add_argument("--setup", action="store_true", help="повторно запустить мастер настройки")
-    parser.add_argument("--login", action="store_true", help="совместимость: запустить мастер настройки")
-    parser.add_argument("--config", default=str(CONFIG_PATH), help="путь к конфигурации")
-    parser.add_argument("--state", default=None, help="путь к Playwright storage state JSON")
+    parser.add_argument("--setup", action="store_true", help="re-run the setup wizard")
+    parser.add_argument("--login", action="store_true", help="compatibility alias for --setup")
+    parser.add_argument("--config", default=str(CONFIG_PATH), help="path to the config file")
+    parser.add_argument("--state", default=None, help="path to the Playwright storage state JSON")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     setup_logging()
     try:
-        code = asyncio.run(run(parse_args()))
+        arguments = parse_args()
+        code = asyncio.run(run(arguments))
+        while code == RESTART_EXIT_CODE:
+            arguments.setup = arguments.login = False
+            code = asyncio.run(run(arguments))
         log.info("exit code=%s", code)
         raise SystemExit(code)
     except KeyboardInterrupt:
@@ -1182,5 +1596,5 @@ if __name__ == "__main__":
         import traceback
 
         traceback.print_exc()
-        print(f"\nЛог: {LOG_PATH}", file=sys.stderr)
+        print(f"\nLog: {LOG_PATH}", file=sys.stderr)
         raise SystemExit(1)

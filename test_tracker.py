@@ -10,7 +10,7 @@ def test_normalize_feed_and_join_uri():
         'duration': 95, 'server': {'job_id': 'abc/123', 'players': [1, 2]},
     }])
     assert len(rows) == 1
-    assert rows[0].status == 'Открыто'
+    assert rows[0].status == 'Open'
     assert rows[0].timer == '01:35'
     assert rows[0].players == '2'
     assert rows[0].join_uri.endswith('gameInstanceId=abc%2F123')
@@ -107,3 +107,37 @@ def test_latest_for_marker_skips_last_job():
     assert tracker.latest_for_marker(rows, "m").job_id == "a"
     assert tracker.latest_for_marker(rows, "m", exclude_job="a").job_id == "b"
     assert tracker.latest_for_marker(rows[:1], "m", exclude_job="a") is None
+
+
+def test_normalize_muffin_feed():
+    import tracker
+    data = [
+        {"_id": "s1", "lastUpdated": "2026-01-01T10:20:30Z",
+         "ServerInfo": {"JobID": "job-1", "CrimCount": 3, "PoliceCount": 2},
+         "RegionData": {"geolocation": {"city": "Paris", "country": "France"}},
+         "RobberyData": {"2": {"Descs": {"Status": "Open!"}}, "3": {"Descs": {"Status": "In Robbery"}}, "4": {"Descs": {"Status": "Closed"}}}},
+        {"_id": "s2", "ServerInfo": {}, "RobberyData": {"1": {"Descs": {"Status": "Open"}}}},
+    ]
+    rows = tracker.normalize_muffin_feed({"servers": data})
+    assert [(r.name, r.status_code) for r in rows] == [("Jewelry Store", 1), ("Museum", 2)]
+    assert rows[0].job_id == "job-1" and rows[0].source_id == "s1"
+    assert rows[0].total_players == 5 and rows[0].region == "Paris, France"
+    assert rows[0].opening_time == "10:20:30" and rows[0].joinable
+
+
+def test_table_keeps_full_server_id_and_has_no_region():
+    t = tracker.Translator("en")
+    columns = tracker._table_columns(t, 130)
+    titles = [title for title, _ in columns]
+    assert "Region" not in titles
+    assert dict(columns)["Server"] >= 36
+
+
+def test_english_ui_has_no_cyrillic():
+    import re
+    t = tracker.Translator("en")
+    for key in tracker.TRANSLATIONS["en"]:
+        if key in ("russian", "choose_language", "wizard_title"):
+            continue
+        assert not re.search("[А-Яа-я]", t(key) if "{" not in tracker.TRANSLATIONS["en"][key] else tracker.TRANSLATIONS["en"][key]), key
+    assert tracker._status(1)[0] == "Open"

@@ -21,25 +21,30 @@ chmod +x run.sh
 ./run.sh
 ```
 
-On first run `run.sh` creates `.venv`, installs Playwright and Chromium, and starts the app. A setup wizard then asks for:
+On first run `run.sh` creates `.venv`, installs Playwright and Chromium, and starts the app. A full-screen setup wizard (arrows or digits to pick, `Enter` to confirm, `Esc` to go back) then asks for:
 
 1. interface language (EN / RU);
-2. data source (currently Jailbreak Changelogs);
+2. data source: Jailbreak Changelogs or MuffinHook;
 3. your token (see below);
 4. the dashboard starts.
 
-Re-run the wizard with `./run.sh --setup`. Print the version with `./run.sh --version`.
+Re-run the wizard with `./run.sh --setup`; your pity settings are kept. Print the version with `./run.sh --version`.
 
 ## How it works
 
 1. JailSpy opens the robberies page in headless Chromium (Playwright) using your session and listens to the page's WebSocket. It reads the `recent_robberies` messages.
-2. Each message is normalised into a table row: status, opening time (`hh:mm:ss`), server ID, total / criminal / cop counts, region, and a "full" flag.
+2. Each message is normalised into a table row: status, opening time (`hh:mm:ss`), full server ID, total / criminal / cop counts, and a "full" flag.
 3. If no frame arrives for a while, the page is reloaded automatically.
 4. Joining builds the deep link `roblox://experiences/start?placeId=606849621&gameInstanceId=<job-id>`. Auto-join starts it with `flatpak run org.vinegarhq.Sober <uri>`.
 
 A server counts as full when `criminals >= min(18, 4 * (cops + 1))`. If the feed has no team counts, the flag is shown as unknown/No.
 
-The Region column can be empty because the feed does not always provide a region.
+## Data sources
+
+- **Jailbreak Changelogs**: WebSocket feed read through headless Chromium.
+- **MuffinHook** (muffinhook.site): polls `https://api.muffinhook.site/export/servers` every 5 seconds over plain HTTPS, with no browser. Each open or in-progress robbery on a server becomes one table row, with the same columns and auto-join logic as the first source. The real Roblox job ID is requested only when you join.
+
+Choose the source in the setup wizard (`./run.sh --setup`).
 
 ## Authentication (token)
 
@@ -50,7 +55,9 @@ JailSpy never reads your browser profile. You paste the token yourself:
 3. Copy the value of the `jbcl_token` cookie.
 4. Paste it into JailSpy when asked. Input is hidden.
 
-The token is stored as a cookie in `~/.local/share/jailspy/storage-state.json` (file mode `600`). Settings are stored in `~/.config/jailspy/config.json`. Both live outside the project folder. Never publish or share them; anyone with the token can act as your account. To replace the token, run `./run.sh --setup`.
+For **MuffinHook**: sign in with Discord at muffinhook.site, open DevTools → Application/Storage → Local Storage → `https://www.muffinhook.site`, and copy the value of `muffin_auth_token`. It is stored in `~/.local/share/jailspy/muffinhook-token` (mode `600`). The token is sent only to `api.muffinhook.site`.
+
+For Jailbreak Changelogs, the token is stored as a cookie in `~/.local/share/jailspy/storage-state.json` (file mode `600`). Settings are stored in `~/.config/jailspy/config.json`. Both live outside the project folder. Never publish or share them; anyone with the token can act as your account. To replace the token, run `./run.sh --setup`.
 
 ## Auto-join
 
@@ -84,10 +91,15 @@ Hotkeys are shown in `[ ]` in the UI and also work on the Russian keyboard layou
 | `P` | Toggle Pity cooldown |
 | `D` | Set Pity cooldown delay in seconds |
 | `L` | Switch language EN / RU (saved) |
+| `S` | Open the settings menu: language, data source, pity delay, change token |
 | `R` | Reconnect the data source |
 | `Q` / `Esc` | Quit |
 
 Enabled toggles are highlighted in green.
+
+## Settings menu
+
+`S` opens a full-screen menu in the same style as the dashboard. It changes the language, the data source, the pity delay, and the token. Changing the source or token restarts the data connection automatically.
 
 ## Status panel
 
